@@ -99,6 +99,7 @@ typedef struct FileLock {
     char filepath[512];
     int readers;
     int writers;
+    SOCKET owner_socket; // Valid if writers > 0
     struct FileLock *next;
 } FileLock;
 
@@ -118,40 +119,54 @@ FileLock* get_file_lock(const char *path) {
     strcpy(new_lock->filepath, path);
     new_lock->readers = 0;
     new_lock->writers = 0;
+    new_lock->owner_socket = INVALID_SOCKET;
     new_lock->next = head_lock;
     head_lock = new_lock;
     LeaveCriticalSection(&file_locks_cs);
     return new_lock;
 }
 
-void acquire_write_lock(FileLock *l, SOCKET c) {
-    int notified = 0;
-    while(1) {
-        EnterCriticalSection(&file_locks_cs);
-        if (l->writers == 0 && l->readers == 0) {
-            l->writers = 1;
-            LeaveCriticalSection(&file_locks_cs);
-            break;
+// Releases all locks held by a specific client (on disconnect)
+void release_all_locks_for_client(SOCKET c) {
+    EnterCriticalSection(&file_locks_cs);
+    FileLock *curr = head_lock;
+    while(curr) {
+        if(curr->writers > 0 && curr->owner_socket == c) {
+            curr->writers = 0;
+            curr->owner_socket = INVALID_SOCKET;
+            printf("[DEBUG] Auto-released lock for %s on disconnect\n", curr->filepath);
         }
-        LeaveCriticalSection(&file_locks_cs);
-        
-        if (!notified) {
-            char *msg = "Server: File is currently locked for writing by another user. Please wait.\n";
-            send(c, msg, strlen(msg), 0);
-            notified = 1;
-        }
-        Sleep(200);
+        curr = curr->next;
     }
-    char *msg = "Server: WRITE_LOCK_GRANTED. You may write now.\n";
-    send(c, msg, strlen(msg), 0);
+    LeaveCriticalSection(&file_locks_cs);
+}
+
+// Tries to acquire lock. Returns 1 if successful, 0 if denied.
+// If already locked by 'c', returns 1.
+int try_acquire_write_lock(FileLock *l, SOCKET c) {
+    int result = 0;
+    EnterCriticalSection(&file_locks_cs);
+    
+    if (l->writers > 0 && l->owner_socket == c) {
+        result = 1; // Already owned
+    }
+    else if (l->writers == 0 && l->readers == 0) {
+        l->writers = 1;
+        l->owner_socket = c;
+        result = 1;
+    }
+    
+    LeaveCriticalSection(&file_locks_cs);
+    return result;
 }
 
 void release_write_lock(FileLock *l, SOCKET c) {
     EnterCriticalSection(&file_locks_cs);
-    l->writers = 0;
+    if (l->writers > 0 && l->owner_socket == c) {
+        l->writers = 0;
+        l->owner_socket = INVALID_SOCKET;
+    }
     LeaveCriticalSection(&file_locks_cs);
-    char *msg = "Server: WRITE_COMPLETED. File unlocked.\n";
-    send(c, msg, strlen(msg), 0);
 }
 
 void acquire_read_lock(FileLock *l, SOCKET c) {
@@ -402,7 +417,10 @@ void handle_client(SOCKET c) {
     while (1) {
         memset(buf, 0, BUF);
         int r = recv(c, buf, BUF, 0);
-        if (r <= 0) break;
+        if (r <= 0) {
+            release_all_locks_for_client(c);
+            break;
+        }
         
         printf("[DEBUG] Raw Received: '%s'\n", buf);
 
@@ -669,6 +687,33 @@ void handle_client(SOCKET c) {
             }
         }
 
+        /* LOCK_FILE */
+        else if (strcmp(cmd, "LOCK_FILE") == 0) {
+            sscanf(buf, "%*s %s", a1);
+            if (resolve_path(current_user, a1, path1, "WRITE")) {
+                 FileLock *l = get_file_lock(path1);
+                 if (try_acquire_write_lock(l, c)) {
+                     send(c, "WRITE_LOCK_GRANTED\n", 19, 0);
+                 } else {
+                     send(c, "WRITE_LOCK_DENIED: File is currently locked by another user\n", 54, 0);
+                 }
+            } else {
+                 send(c, "Error: Access Denied or File Not Found\n", 37, 0);
+            }
+        }
+
+        /* UNLOCK_FILE */
+        else if (strcmp(cmd, "UNLOCK_FILE") == 0) {
+            sscanf(buf, "%*s %s", a1);
+            if (resolve_path(current_user, a1, path1, "WRITE")) {
+                 FileLock *l = get_file_lock(path1);
+                 release_write_lock(l, c);
+                 send(c, "FILE_UNLOCKED\n", 14, 0);
+            } else {
+                 send(c, "Error: Access Denied\n", 21, 0);
+            }
+        }
+
         /* WRITE */
         else if (strcmp(cmd, "WRITE") == 0) {
             char data[512];
@@ -676,17 +721,24 @@ void handle_client(SOCKET c) {
             
             if (resolve_path(current_user, a1, path1, "WRITE")) {
                 FileLock *l = get_file_lock(path1);
-                acquire_write_lock(l, c);
                 
-                FILE *fp = fopen(path1, "a");
-                if (!fp)
-                    send(c, "File not found\n", 15, 0);
-                else {
-                    fprintf(fp, "%s", data);
-                    fclose(fp);
-                    send(c, "Write successful\n", 17, 0);
+                // Try acquire lock (if user doesn't already have it)
+                // In strict mode, user should have called LOCK_FILE first, 
+                // but we allow atomic write if free.
+                if (try_acquire_write_lock(l, c)) {
+                    FILE *fp = fopen(path1, "a");
+                    if (!fp)
+                        send(c, "File not found\n", 15, 0);
+                    else {
+                        fprintf(fp, "%s", data);
+                        fclose(fp);
+                        send(c, "WRITE_COMPLETED\n", 16, 0); // Prompt Requirement
+                    }
+                    // Prompt says: "The server must release the file lock immediately"
+                    release_write_lock(l, c);
+                } else {
+                     send(c, "ACCESS DENIED: File is currently locked by another user\n", 54, 0);
                 }
-                release_write_lock(l, c);
             } else {
                 send(c, "Access Denied (Write)\n", 22, 0);
             }

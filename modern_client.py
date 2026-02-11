@@ -405,10 +405,38 @@ class MainFrame(ctk.CTkFrame):
         if f: self.log_output(self.cmd_cb(f"READ {f}"))
         
     def write_file(self):
+        # 1. Enter Filename
         f = self._ask_input("Write File", "Enter Filename (or SHARED/user/folder/file):")
-        if f:
-            c = self._ask_input("Write Content", "Enter text to append:")
-            if c: self.log_output(self.cmd_cb(f"WRITE {f} {c}"))
+        if not f: return
+
+        # 2. Request Lock
+        self.log_output(f"Requesting WRITE LOCK for {f}...")
+        resp = self.cmd_cb(f"LOCK_FILE {f}")
+
+        # 3. Check Lock Status
+        if "WRITE_LOCK_GRANTED" in resp:
+            self.log_output("Lock Acquired. You may type now.")
+            
+            # 4. Enter Text (Exclusive Access)
+            c = self._ask_input("Write Content", f"Writing to {f}\n(File is locked for you)\nEnter text to append:")
+            
+            if c:
+                # 5. Write and Release
+                # The WRITE command in server now auto-releases lock after writing
+                write_resp = self.cmd_cb(f"WRITE {f} {c}")
+                self.log_output(write_resp)
+            else:
+                # 6. Cancelled - Must manually release lock
+                self.log_output("Operation canceled. Releasing lock.")
+                unlock_resp = self.cmd_cb(f"UNLOCK_FILE {f}")
+                self.log_output(unlock_resp)
+
+        elif "WRITE_LOCK_DENIED" in resp:
+             self.log_output(f"ACCESS DENIED: {resp}")
+             messagebox.showerror("Access Denied", "File is currently locked by another user.\nPlease try again later.")
+        
+        else:
+             self.log_output(f"Server Error: {resp}")
 
     def mk_dir(self):
         val = self._ask_input("New Folder", "Folder Name:")
