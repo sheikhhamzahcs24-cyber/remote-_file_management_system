@@ -1,0 +1,24 @@
+
+# Binaries
+*.exe
+*.dll
+*.o
+
+# Logs
+*.log
+server_log.txt
+
+# Databases
+users.txt
+shared_folders.txt
+
+# Local Storage
+storage/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDEs
+.vscode/
+.idea/
